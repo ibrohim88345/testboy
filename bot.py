@@ -5,11 +5,12 @@ import asyncio
 from datetime import datetime
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ChatMember
+    ChatMember, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters,
+    ConversationHandler
 )
 from telegram.constants import ParseMode
 from reportlab.lib.pagesizes import A4
@@ -17,22 +18,22 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    HRFlowable
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 )
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 import io
 
 # ===================== KONFIGURATSIYA =====================
 BOT_TOKEN = "8950300608:AAGKzpg2uIyKlijdgO7JhdMZLpo2nYIuHzo"
-ADMIN_ID = None  # Birinchi /start bosgan admin bo'ladi, yoki quyida qo'ying
 CHANNEL_USERNAME = "@huquqologiyauz"
 CHANNEL_LINK = "https://t.me/huquqologiyauz"
-
-# Ma'lumotlar fayli
 DATA_FILE = "data.json"
+
+# ConversationHandler states
+(
+    ADD_TEST_NAME, ADD_TEST_ID, ADD_TEST_ANSWERS,
+    SUBMIT_FULLNAME, SUBMIT_TEST_ID, SUBMIT_ANSWERS
+) = range(6)
 
 # ===================== MA'LUMOTLAR =====================
 def load_data():
@@ -40,9 +41,10 @@ def load_data():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {
-        "admin_id": None,
-        "tests": {},       # test_id -> {name, answers, created_at, active}
-        "results": {}      # test_id -> [{"user_id","username","answers","score","date"}]
+        "tests": {},
+        # test_id -> {name, answers, created_at, active, owner_id}
+        "results": {}
+        # test_id -> [{user_id, fullname, answers, score, date}]
     }
 
 def save_data(data):
@@ -52,45 +54,52 @@ def save_data(data):
 # ===================== KANAL TEKSHIRISH =====================
 async def check_subscription(user_id: int, bot) -> bool:
     try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in [
-            ChatMember.MEMBER,
-            ChatMember.ADMINISTRATOR,
-            ChatMember.OWNER
-        ]
-    except Exception:
-        return False
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception as e:
+        print(f"Kanal tekshirish xatosi: {e}")
+        # Agar kanal topilmasa yoki bot admin emas bo'lsa, o'tkazib yuboramiz
+        return True
 
-def subscription_keyboard():
-    keyboard = [
+def sub_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=CHANNEL_LINK)],
         [InlineKeyboardButton("✅ A'zo bo'ldim, tekshir", callback_data="check_sub")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
-# ===================== JAVOBLARNI PARSE QILISH =====================
+# ===================== JAVOB PARSE =====================
 def parse_answers(text: str):
-    """1a2b3c4d shaklida parse qiladi"""
+    """1a2b3c shaklida parse, har savolga faqat 1 ta javob"""
     text = text.strip().lower().replace(" ", "")
-    pattern = re.findall(r'(\d+)([a-e])', text)
-    if not pattern:
-        return None
+    pairs = re.findall(r'(\d+)([a-e])', text)
+    if not pairs:
+        return None, "Format noto'g'ri"
+    
     answers = {}
-    for num, letter in pattern:
-        answers[int(num)] = letter
-    return answers
+    for num_str, letter in pairs:
+        num = int(num_str)
+        if num in answers:
+            return None, f"⚠️ {num}-savol uchun bir nechta javob kiritdingiz! Har savolga faqat 1 ta harf kiriting."
+        answers[num] = letter
+    return answers, None
 
-def format_answers(answers: dict) -> str:
-    return "".join(f"{k}{v}" for k, v in sorted(answers.items()))
+def validate_answers_strict(text: str):
+    """Har bir raqamdan keyin faqat 1 ta harf bo'lishini tekshirish"""
+    text = text.strip().lower().replace(" ", "")
+    # Agar raqamdan keyin 2 ta harf bo'lsa xato
+    invalid = re.findall(r'\d+[a-e]{2,}', text)
+    if invalid:
+        return False, f"❌ Xato format: `{'  '.join(invalid)}` — har savolga faqat 1 ta harf (a/b/c/d/e)"
+    return True, None
 
-# ===================== NATIJALARNI HISOBLASH =====================
+# ===================== NATIJA HISOBLASH =====================
 def calculate_result(correct: dict, user: dict):
     total = len(correct)
     right = 0
     wrong = []
     missing = []
-    
     for num, ans in correct.items():
+        num = int(num)
         if num in user:
             if user[num] == ans:
                 right += 1
@@ -98,151 +107,105 @@ def calculate_result(correct: dict, user: dict):
                 wrong.append((num, user[num], ans))
         else:
             missing.append(num)
-    
     return {
-        "total": total,
-        "right": right,
-        "wrong": wrong,
-        "missing": missing,
+        "total": total, "right": right,
+        "wrong": wrong, "missing": missing,
         "percent": round(right / total * 100, 1) if total > 0 else 0
     }
 
 # ===================== PDF GENERATSIYA =====================
 def generate_pdf(test_name: str, results: list, correct_answers: dict) -> bytes:
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4,
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
         rightMargin=1.5*cm, leftMargin=1.5*cm,
-        topMargin=2*cm, bottomMargin=1.5*cm
-    )
-    
-    story = []
-    
-    # Ranglar
-    PRIMARY = colors.HexColor('#1a237e')
+        topMargin=2*cm, bottomMargin=1.5*cm)
+
+    PRIMARY   = colors.HexColor('#1a237e')
     SECONDARY = colors.HexColor('#283593')
-    ACCENT = colors.HexColor('#e8eaf6')
-    GREEN = colors.HexColor('#2e7d32')
-    RED = colors.HexColor('#c62828')
-    GOLD = colors.HexColor('#f57f17')
-    LIGHT_GRAY = colors.HexColor('#f5f5f5')
-    WHITE = colors.white
-    
-    styles = getSampleStyleSheet()
-    
-    title_style = ParagraphStyle(
-        'Title', fontSize=20, textColor=WHITE,
-        alignment=TA_CENTER, fontName='Helvetica-Bold',
-        spaceAfter=4
-    )
-    subtitle_style = ParagraphStyle(
-        'Subtitle', fontSize=11, textColor=colors.HexColor('#c5cae9'),
-        alignment=TA_CENTER, fontName='Helvetica', spaceAfter=0
-    )
-    header_style = ParagraphStyle(
-        'Header', fontSize=13, textColor=PRIMARY,
-        fontName='Helvetica-Bold', spaceAfter=6
-    )
-    normal_style = ParagraphStyle(
-        'Normal2', fontSize=9, textColor=colors.HexColor('#424242'),
-        fontName='Helvetica'
-    )
-    
-    # --- SARLAVHA BLOKI ---
-    title_table = Table(
-        [[Paragraph(f"📊 {test_name}", title_style)],
-         [Paragraph(f"Natijalar statistikasi | {datetime.now().strftime('%d.%m.%Y %H:%M')}", subtitle_style)]],
-        colWidths=[18*cm]
-    )
-    title_table.setStyle(TableStyle([
+    ACCENT    = colors.HexColor('#e8eaf6')
+    GREEN     = colors.HexColor('#2e7d32')
+    RED       = colors.HexColor('#c62828')
+    GOLD      = colors.HexColor('#f57f17')
+    LIGHT     = colors.HexColor('#f5f5f5')
+    WHITE     = colors.white
+
+    title_s = ParagraphStyle('T', fontSize=18, textColor=WHITE,
+        alignment=TA_CENTER, fontName='Helvetica-Bold')
+    sub_s = ParagraphStyle('S', fontSize=9, textColor=colors.HexColor('#c5cae9'),
+        alignment=TA_CENTER, fontName='Helvetica')
+    hdr_s = ParagraphStyle('H', fontSize=12, textColor=PRIMARY,
+        fontName='Helvetica-Bold', spaceAfter=5)
+
+    story = []
+
+    # SARLAVHA
+    title_tbl = Table([
+        [Paragraph(f"📊 {test_name}", title_s)],
+        [Paragraph(f"Natijalar | {datetime.now().strftime('%d.%m.%Y %H:%M')}", sub_s)]
+    ], colWidths=[18*cm])
+    title_tbl.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,-1), PRIMARY),
-        ('TOPPADDING', (0,0), (-1,0), 16),
-        ('BOTTOMPADDING', (0,-1), (-1,-1), 16),
+        ('TOPPADDING', (0,0), (-1,-1), 14),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 14),
         ('LEFTPADDING', (0,0), (-1,-1), 20),
-        ('RIGHTPADDING', (0,0), (-1,-1), 20),
-        ('ROUNDEDCORNERS', [8]),
     ]))
-    story.append(title_table)
-    story.append(Spacer(1, 0.5*cm))
-    
-    # --- UMUMIY STATISTIKA ---
+    story.append(title_tbl)
+    story.append(Spacer(1, 0.4*cm))
+
+    # UMUMIY STATISTIKA
     if results:
         scores = [r['score'] for r in results]
-        avg = round(sum(scores) / len(scores), 1)
-        max_s = max(scores)
-        min_s = min(scores)
         total_q = len(correct_answers)
-        
-        stat_data = [
-            ['👥 Ishtirokchilar', '📝 Savollar', '📈 O\'rtacha', '🏆 Eng yuqori', '📉 Eng past'],
-            [
-                str(len(results)),
-                str(total_q),
-                f"{avg}/{total_q}",
-                f"{max_s}/{total_q}",
-                f"{min_s}/{total_q}"
-            ]
-        ]
-        
-        stat_table = Table(stat_data, colWidths=[3.4*cm]*5)
-        stat_table.setStyle(TableStyle([
+        avg = round(sum(scores)/len(scores), 1)
+        stat = Table([
+            ['👥 Ishtirokchi', '📝 Savol', '📈 O\'rtacha', '🏆 Yuqori', '📉 Past'],
+            [str(len(results)), str(total_q),
+             f"{avg}/{total_q}", f"{max(scores)}/{total_q}", f"{min(scores)}/{total_q}"]
+        ], colWidths=[3.4*cm]*5)
+        stat.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), SECONDARY),
             ('TEXTCOLOR', (0,0), (-1,0), WHITE),
             ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
             ('FONTSIZE', (0,0), (-1,0), 8),
-            ('BACKGROUND', (0,1), (-1,-1), ACCENT),
-            ('TEXTCOLOR', (0,1), (-1,-1), PRIMARY),
-            ('FONTNAME', (0,1), (-1,-1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,1), (-1,-1), 14),
+            ('BACKGROUND', (0,1), (-1,1), ACCENT),
+            ('TEXTCOLOR', (0,1), (-1,1), PRIMARY),
+            ('FONTNAME', (0,1), (-1,1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,1), (-1,1), 13),
             ('ALIGN', (0,0), (-1,-1), 'CENTER'),
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [ACCENT]),
-            ('TOPPADDING', (0,0), (-1,-1), 10),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 10),
+            ('TOPPADDING', (0,0), (-1,-1), 9),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 9),
             ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#9fa8da')),
         ]))
-        story.append(stat_table)
+        story.append(stat)
         story.append(Spacer(1, 0.4*cm))
-    
-    # --- NATIJALAR JADVALI ---
-    story.append(Paragraph("🏅 Ishtirokchilar natijalari", header_style))
-    
-    table_data = [['#', 'Ism', 'To\'g\'ri', 'Xato', 'Ball', '%', 'Sana']]
-    
-    sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
-    
-    for i, r in enumerate(sorted_results, 1):
-        total_q = len(correct_answers)
-        wrong_count = total_q - r['score']
-        percent = round(r['score'] / total_q * 100, 1) if total_q > 0 else 0
-        
-        # Rang belgilash
-        if percent >= 80:
-            ball_color = GREEN
-        elif percent >= 50:
-            ball_color = GOLD
-        else:
-            ball_color = RED
-        
-        # Medal
-        medal = {1: '🥇', 2: '🥈', 3: '🥉'}.get(i, str(i))
-        
-        name = r.get('username') or r.get('first_name') or f"Foydalanuvchi {r['user_id']}"
-        
-        table_data.append([
-            medal,
-            name[:22],
-            str(r['score']),
-            str(wrong_count),
-            f"{r['score']}/{total_q}",
-            f"{percent}%",
-            r.get('date', '')[:10]
+
+    # NATIJALAR JADVALI — ball bo'yicha, teng bo'lsa vaqt bo'yicha
+    story.append(Paragraph("🏅 Ishtirokchilar natijalari", hdr_s))
+
+    sorted_r = sorted(results,
+        key=lambda x: (-x['score'], x.get('date', '')))
+
+    total_q = len(correct_answers)
+    tbl_data = [['#', 'Ism Familiya', 'To\'g\'ri', 'Xato', 'Ball', '%', 'Vaqt']]
+    for i, r in enumerate(sorted_r, 1):
+        medal = {1:'🥇',2:'🥈',3:'🥉'}.get(i, str(i))
+        wrong_c = total_q - r['score']
+        pct = round(r['score']/total_q*100, 1) if total_q > 0 else 0
+        # Vaqt formatlash
+        try:
+            dt = datetime.fromisoformat(r.get('date',''))
+            vaqt = dt.strftime('%d.%m %H:%M')
+        except:
+            vaqt = r.get('date','')[:10]
+        tbl_data.append([
+            medal, r.get('fullname','Noma\'lum')[:24],
+            str(r['score']), str(wrong_c),
+            f"{r['score']}/{total_q}", f"{pct}%", vaqt
         ])
-    
-    col_widths = [1.2*cm, 5*cm, 2*cm, 2*cm, 2*cm, 2*cm, 2.5*cm]
-    results_table = Table(table_data, colWidths=col_widths)
-    
-    table_style = [
+
+    res_tbl = Table(tbl_data, colWidths=[1*cm, 5.5*cm, 1.8*cm, 1.8*cm, 1.8*cm, 1.8*cm, 2.3*cm])
+    ts = [
         ('BACKGROUND', (0,0), (-1,0), PRIMARY),
         ('TEXTCOLOR', (0,0), (-1,0), WHITE),
         ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
@@ -250,757 +213,753 @@ def generate_pdf(test_name: str, results: list, correct_answers: dict) -> bytes:
         ('ALIGN', (0,0), (-1,-1), 'CENTER'),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ('FONTSIZE', (0,1), (-1,-1), 8),
-        ('TOPPADDING', (0,0), (-1,-1), 7),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
         ('GRID', (0,0), (-1,-1), 0.3, colors.HexColor('#c5cae9')),
     ]
-    
-    for i in range(1, len(table_data)):
-        bg = WHITE if i % 2 == 0 else LIGHT_GRAY
-        table_style.append(('BACKGROUND', (0,i), (-1,i), bg))
-        
-        # Ball ustuniga rang
-        total_q = len(correct_answers)
+    for i in range(1, len(tbl_data)):
+        bg = WHITE if i % 2 == 0 else LIGHT
+        ts.append(('BACKGROUND', (0,i), (-1,i), bg))
         try:
-            score = sorted_results[i-1]['score']
-            pct = score / total_q * 100 if total_q > 0 else 0
-            if pct >= 80:
-                table_style.append(('TEXTCOLOR', (4,i), (5,i), GREEN))
-            elif pct >= 50:
-                table_style.append(('TEXTCOLOR', (4,i), (5,i), GOLD))
-            else:
-                table_style.append(('TEXTCOLOR', (4,i), (5,i), RED))
-            table_style.append(('FONTNAME', (4,i), (5,i), 'Helvetica-Bold'))
-        except:
-            pass
-    
-    results_table.setStyle(TableStyle(table_style))
-    story.append(results_table)
+            sc = sorted_r[i-1]['score']
+            p = sc/total_q*100 if total_q > 0 else 0
+            c = GREEN if p >= 80 else (GOLD if p >= 50 else RED)
+            ts += [('TEXTCOLOR', (4,i), (5,i), c),
+                   ('FONTNAME', (4,i), (5,i), 'Helvetica-Bold')]
+        except: pass
+    res_tbl.setStyle(TableStyle(ts))
+    story.append(res_tbl)
     story.append(Spacer(1, 0.4*cm))
-    
-    # --- TO'G'RI JAVOBLAR ---
-    story.append(Paragraph("✅ To'g'ri javoblar", header_style))
-    
-    ans_items = sorted(correct_answers.items())
-    rows_per_row = 10
-    ans_rows = []
-    
-    for i in range(0, len(ans_items), rows_per_row):
-        chunk = ans_items[i:i+rows_per_row]
-        header_row = [f"#{num}" for num, _ in chunk]
-        ans_row = [ans.upper() for _, ans in chunk]
-        # pad
-        while len(header_row) < rows_per_row:
-            header_row.append('')
-            ans_row.append('')
-        ans_rows.append(header_row)
-        ans_rows.append(ans_row)
-    
-    if ans_rows:
-        col_w = [1.7*cm] * rows_per_row
-        ans_table = Table(ans_rows, colWidths=col_w)
-        ans_style = []
-        for i in range(0, len(ans_rows), 2):
-            ans_style += [
-                ('BACKGROUND', (0,i), (-1,i), SECONDARY),
-                ('TEXTCOLOR', (0,i), (-1,i), WHITE),
-                ('FONTNAME', (0,i), (-1,i), 'Helvetica-Bold'),
-                ('FONTSIZE', (0,i), (-1,i), 7),
-                ('BACKGROUND', (0,i+1), (-1,i+1), colors.HexColor('#e8eaf6')),
-                ('TEXTCOLOR', (0,i+1), (-1,i+1), PRIMARY),
-                ('FONTNAME', (0,i+1), (-1,i+1), 'Helvetica-Bold'),
-                ('FONTSIZE', (0,i+1), (-1,i+1), 10),
+
+    # TO'G'RI JAVOBLAR
+    story.append(Paragraph("✅ To'g'ri javoblar", hdr_s))
+    ans_items = sorted(correct_answers.items(), key=lambda x: int(x[0]))
+    rprow = 10
+    rows = []
+    for i in range(0, len(ans_items), rprow):
+        chunk = ans_items[i:i+rprow]
+        hr = [f"#{n}" for n,_ in chunk]
+        ar = [a.upper() for _,a in chunk]
+        while len(hr) < rprow: hr.append(''); ar.append('')
+        rows.append(hr); rows.append(ar)
+
+    if rows:
+        at = Table(rows, colWidths=[1.7*cm]*rprow)
+        ast_ = []
+        for i in range(0, len(rows), 2):
+            ast_ += [
+                ('BACKGROUND',(0,i),(-1,i), SECONDARY),
+                ('TEXTCOLOR',(0,i),(-1,i), WHITE),
+                ('FONTNAME',(0,i),(-1,i),'Helvetica-Bold'),
+                ('FONTSIZE',(0,i),(-1,i),7),
+                ('BACKGROUND',(0,i+1),(-1,i+1), ACCENT),
+                ('TEXTCOLOR',(0,i+1),(-1,i+1), PRIMARY),
+                ('FONTNAME',(0,i+1),(-1,i+1),'Helvetica-Bold'),
+                ('FONTSIZE',(0,i+1),(-1,i+1),10),
             ]
-        ans_style += [
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ('TOPPADDING', (0,0), (-1,-1), 5),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-            ('GRID', (0,0), (-1,-1), 0.3, colors.HexColor('#9fa8da')),
+        ast_ += [
+            ('ALIGN',(0,0),(-1,-1),'CENTER'),
+            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+            ('TOPPADDING',(0,0),(-1,-1),5),
+            ('BOTTOMPADDING',(0,0),(-1,-1),5),
+            ('GRID',(0,0),(-1,-1),0.3,colors.HexColor('#9fa8da')),
         ]
-        ans_table.setStyle(TableStyle(ans_style))
-        story.append(ans_table)
-    
-    # --- FOOTER ---
-    story.append(Spacer(1, 0.5*cm))
-    footer_data = [[f"© {datetime.now().year} | @huquqologiyauz | Yaratilgan vaqt: {datetime.now().strftime('%d.%m.%Y %H:%M')}"]]
-    footer_table = Table(footer_data, colWidths=[18*cm])
-    footer_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), PRIMARY),
-        ('TEXTCOLOR', (0,0), (-1,-1), colors.HexColor('#c5cae9')),
-        ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
-        ('FONTSIZE', (0,0), (-1,-1), 8),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('TOPPADDING', (0,0), (-1,-1), 8),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+        at.setStyle(TableStyle(ast_))
+        story.append(at)
+
+    # FOOTER
+    story.append(Spacer(1, 0.4*cm))
+    ft = Table([[f"© {datetime.now().year} | {CHANNEL_USERNAME} | {datetime.now().strftime('%d.%m.%Y %H:%M')}"]], colWidths=[18*cm])
+    ft.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,-1), PRIMARY),
+        ('TEXTCOLOR',(0,0),(-1,-1), colors.HexColor('#c5cae9')),
+        ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
+        ('FONTSIZE',(0,0),(-1,-1),8),
+        ('ALIGN',(0,0),(-1,-1),'CENTER'),
+        ('TOPPADDING',(0,0),(-1,-1),8),
+        ('BOTTOMPADDING',(0,0),(-1,-1),8),
     ]))
-    story.append(footer_table)
-    
+    story.append(ft)
     doc.build(story)
     return buffer.getvalue()
 
-# ===================== HANDLERS =====================
+# ===================== KLAVIATURALAR =====================
+def main_menu_keyboard(user_id, data):
+    """Har bir foydalanuvchi uchun asosiy menyu"""
+    my_tests = [tid for tid, t in data["tests"].items() if t.get("owner_id") == user_id]
+    buttons = [
+        [KeyboardButton("📝 Testga javob berish")],
+        [KeyboardButton("➕ Test qo'shish")],
+    ]
+    if my_tests:
+        buttons.append([KeyboardButton("📋 Mening testlarim")])
+    buttons.append([KeyboardButton("ℹ️ Yordam")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+def admin_test_keyboard(test_id, is_active):
+    buttons = []
+    if is_active:
+        buttons.append([InlineKeyboardButton("🏁 Testni yakunlash", callback_data=f"end:{test_id}")])
+    buttons.append([InlineKeyboardButton("📊 PDF statistika", callback_data=f"pdf:{test_id}")])
+    buttons.append([InlineKeyboardButton("📝 Matn statistika", callback_data=f"txt:{test_id}")])
+    buttons.append([InlineKeyboardButton("🗑 O'chirish", callback_data=f"del:{test_id}")])
+    buttons.append([InlineKeyboardButton("◀️ Orqaga", callback_data="my_tests")])
+    return InlineKeyboardMarkup(buttons)
+
+# ===================== START =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     user = update.effective_user
-    
-    # Birinchi admin
-    if data["admin_id"] is None:
-        data["admin_id"] = user.id
-        save_data(data)
-    
-    is_admin = user.id == data["admin_id"]
-    
-    if is_admin:
-        await update.message.reply_text(
-            f"👋 Salom, Admin!\n\n"
-            f"🤖 *Test Bot* boshqaruv paneliga xush kelibsiz.\n\n"
-            f"📋 *Buyruqlar:*\n"
-            f"➕ /addtest — Yangi test qo'shish\n"
-            f"📊 /tests — Barcha testlar ro'yxati\n"
-            f"🏁 /endtest — Testni yakunlash\n"
-            f"📈 /stats — Statistika (PDF)\n"
-            f"📝 /statstext — Statistika (matn)\n"
-            f"🗑 /deletetest — Testni o'chirish\n"
-            f"ℹ️ /help — Yordam",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-    
-    # Oddiy foydalanuvchi — kanal tekshiruvi
-    is_subscribed = await check_subscription(user.id, context.bot)
-    
-    if not is_subscribed:
+
+    # Kanal tekshiruvi
+    is_sub = await check_subscription(user.id, context.bot)
+    if not is_sub:
         await update.message.reply_text(
             f"👋 Salom, {user.first_name}!\n\n"
-            f"⚠️ Botdan foydalanish uchun avval kanalimizga a'zo bo'lishingiz shart!\n\n"
-            f"📢 Kanal: {CHANNEL_LINK}\n\n"
-            f"A'zo bo'lgach, pastdagi tugmani bosing 👇",
-            reply_markup=subscription_keyboard()
+            f"⚠️ Botdan foydalanish uchun avval kanalimizga a'zo bo'ling!\n\n"
+            f"📢 {CHANNEL_LINK}",
+            reply_markup=sub_keyboard()
         )
-        return
-    
-    await show_user_menu(update, context)
+        return ConversationHandler.END
 
-async def show_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    active_tests = {tid: t for tid, t in data["tests"].items() if t.get("active")}
-    
-    if not active_tests:
-        text = (
-            f"👋 Salom!\n\n"
-            f"📋 Hozirda faol test mavjud emas.\n"
-            f"Tez orada test qo'yiladi, kuting! 🕐"
-        )
-    else:
-        tests_list = "\n".join([f"🔹 *{t['name']}* (ID: `{tid}`)" for tid, t in active_tests.items()])
-        text = (
-            f"👋 Salom!\n\n"
-            f"📝 *Faol testlar:*\n{tests_list}\n\n"
-            f"✍️ Javob yuborish uchun quyidagi formatdan foydalaning:\n"
-            f"```\ntest_id 1a2b3c4d...\n```\n"
-            f"*Misol:* `test1 1a2b3c4d5e`"
-        )
-    
-    await (update.message or update.callback_query.message).reply_text(
-        text, parse_mode=ParseMode.MARKDOWN
+    kb = main_menu_keyboard(user.id, data)
+    await update.message.reply_text(
+        f"👋 Salom, {user.first_name}!\n\n"
+        f"🤖 *Test Bot*ga xush kelibsiz!\n\n"
+        f"Quyidagi tugmalardan foydalaning 👇",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb
     )
+    return ConversationHandler.END
 
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    is_subscribed = await check_subscription(query.from_user.id, context.bot)
-    
-    if not is_subscribed:
+    is_sub = await check_subscription(query.from_user.id, context.bot)
+    if not is_sub:
         await query.edit_message_text(
-            f"❌ Siz hali kanalga a'zo bo'lmadingiz!\n\n"
-            f"Iltimos, avval {CHANNEL_LINK} kanaliga a'zo bo'ling, so'ng qayta tekshiring. 👇",
-            reply_markup=subscription_keyboard()
+            f"❌ Siz hali a'zo bo'lmadingiz!\n\nIltimos, avval kanalga a'zo bo'ling: {CHANNEL_LINK}",
+            reply_markup=sub_keyboard()
         )
         return
-    
-    await query.edit_message_text(
-        f"✅ Zo'r! Siz kanalga a'zo bo'lgansiz.\n\n"
-        f"Endi /start bosib botdan foydalanishingiz mumkin! 🎉"
+    data = load_data()
+    kb = main_menu_keyboard(query.from_user.id, data)
+    await query.edit_message_text("✅ Rahmat! Endi botdan foydalanishingiz mumkin.")
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="Quyidagi tugmalardan foydalaning 👇",
+        reply_markup=kb
     )
 
-# ===================== ADMIN: TEST QO'SHISH =====================
-
-async def addtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== TEST QO'SHISH (ConversationHandler) =====================
+async def add_test_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
-    if update.effective_user.id != data["admin_id"]:
-        await update.message.reply_text("❌ Sizda ruxsat yo'q.")
-        return
-    
-    context.user_data['state'] = 'waiting_test_name'
+    user = update.effective_user
+    is_sub = await check_subscription(user.id, context.bot)
+    if not is_sub:
+        await update.message.reply_text(
+            "⚠️ Botdan foydalanish uchun kanalga a'zo bo'ling!",
+            reply_markup=sub_keyboard()
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
-        "📝 *Yangi test qo'shish*\n\n"
-        "1️⃣ Avval test nomini yuboring:\n"
-        "_(Misol: Jinoyat huquqi — 1-variant)_",
+        "➕ *Yangi test qo'shish*\n\n"
+        "1️⃣ Test nomini yuboring:\n"
+        "_(Misol: Jinoyat huquqi — 1-variant)_\n\n"
+        "Bekor qilish uchun /cancel",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Bekor qilish")]], resize_keyboard=True)
+    )
+    return ADD_TEST_NAME
+
+async def add_test_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Bekor qilish":
+        return await cancel_conv(update, context)
+    context.user_data['new_test_name'] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Nom: *{context.user_data['new_test_name']}*\n\n"
+        f"2️⃣ Test uchun qisqa ID kiriting (lotin, raqam, _):\n"
+        f"_(Misol: huquq1, variant2)_",
         parse_mode=ParseMode.MARKDOWN
     )
+    return ADD_TEST_ID
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_test_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Bekor qilish":
+        return await cancel_conv(update, context)
+    data = load_data()
+    test_id = update.message.text.strip().lower().replace(" ", "_")
+    # Faqat ruxsat etilgan belgilar
+    if not re.match(r'^[a-z0-9_]+$', test_id):
+        await update.message.reply_text(
+            "❌ ID faqat lotin harflari, raqamlar va _ dan iborat bo'lishi kerak.\nQayta kiriting:"
+        )
+        return ADD_TEST_ID
+    if test_id in data["tests"]:
+        await update.message.reply_text(
+            f"⚠️ *{test_id}* ID allaqachon mavjud. Boshqa ID kiriting:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ADD_TEST_ID
+    context.user_data['new_test_id'] = test_id
+    await update.message.reply_text(
+        f"✅ ID: `{test_id}`\n\n"
+        f"3️⃣ To'g'ri javoblarni yuboring:\n"
+        f"📌 Format: `1a2b3c4d5e...`\n"
+        f"_(Har savolga faqat 1 ta harf: a, b, c, d yoki e)_\n\n"
+        f"Misol: `1a2b3d4c5e6b7a8d9c10b`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return ADD_TEST_ANSWERS
+
+async def add_test_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Bekor qilish":
+        return await cancel_conv(update, context)
+
+    text = update.message.text.strip()
+    valid, err = validate_answers_strict(text)
+    if not valid:
+        await update.message.reply_text(err, parse_mode=ParseMode.MARKDOWN)
+        return ADD_TEST_ANSWERS
+
+    answers, err2 = parse_answers(text)
+    if err2:
+        await update.message.reply_text(f"❌ {err2}", parse_mode=ParseMode.MARKDOWN)
+        return ADD_TEST_ANSWERS
+
+    data = load_data()
+    test_id = context.user_data['new_test_id']
+    test_name = context.user_data['new_test_name']
+    owner_id = update.effective_user.id
+
+    data["tests"][test_id] = {
+        "name": test_name,
+        "answers": {str(k): v for k, v in answers.items()},
+        "created_at": datetime.now().isoformat(),
+        "active": True,
+        "owner_id": owner_id
+    }
+    data["results"][test_id] = []
+    save_data(data)
+
+    formatted = "".join(f"{k}{v}" for k, v in sorted(answers.items()))
+    kb = main_menu_keyboard(owner_id, data)
+    await update.message.reply_text(
+        f"✅ *Test muvaffaqiyatli qo'shildi!*\n\n"
+        f"📋 Nom: *{test_name}*\n"
+        f"🔑 ID: `{test_id}`\n"
+        f"📊 Savollar: *{len(answers)}* ta\n"
+        f"🟢 Holat: Faol\n\n"
+        f"*Kanalda e'lon qilish uchun:*\n"
+        f"```\nTest ID: {test_id}\n```\n"
+        f"Foydalanuvchilar shu ID bilan javob yuborishadi.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb
+    )
+    return ConversationHandler.END
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    kb = main_menu_keyboard(update.effective_user.id, data)
+    await update.message.reply_text(
+        "❌ Bekor qilindi.",
+        reply_markup=kb
+    )
+    return ConversationHandler.END
+
+# ===================== TESTGA JAVOB BERISH =====================
+async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user = update.effective_user
+    is_sub = await check_subscription(user.id, context.bot)
+    if not is_sub:
+        await update.message.reply_text(
+            "⚠️ Botdan foydalanish uchun kanalga a'zo bo'ling!",
+            reply_markup=sub_keyboard()
+        )
+        return ConversationHandler.END
+
+    active = {tid: t for tid, t in data["tests"].items() if t.get("active")}
+    if not active:
+        await update.message.reply_text(
+            "📭 Hozirda faol test mavjud emas.\nKeyinroq qaytib keling!",
+            reply_markup=main_menu_keyboard(user.id, data)
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "✍️ *Javob berish*\n\n"
+        "1️⃣ Ism va familiyangizni yuboring:\n"
+        "_(Misol: Usmonov Ibrohim)_\n\n"
+        "/cancel — bekor qilish",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Bekor qilish")]], resize_keyboard=True)
+    )
+    return SUBMIT_FULLNAME
+
+async def submit_fullname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Bekor qilish":
+        return await cancel_conv(update, context)
+    fullname = update.message.text.strip()
+    if len(fullname) < 3:
+        await update.message.reply_text("❌ Ism familiya juda qisqa. Qayta yuboring:")
+        return SUBMIT_FULLNAME
+    context.user_data['submit_fullname'] = fullname
+
+    data = load_data()
+    active = {tid: t for tid, t in data["tests"].items() if t.get("active")}
+    # Faol testlarni ko'rsatish
+    tests_text = "\n".join([f"🔹 *{t['name']}* — ID: `{tid}`" for tid, t in active.items()])
+    await update.message.reply_text(
+        f"👤 Siz: *{fullname}*\n\n"
+        f"2️⃣ Test ID'sini yuboring:\n\n"
+        f"*Faol testlar:*\n{tests_text}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return SUBMIT_TEST_ID
+
+async def submit_test_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Bekor qilish":
+        return await cancel_conv(update, context)
+    data = load_data()
+    test_id = update.message.text.strip().lower()
+    if test_id not in data["tests"]:
+        await update.message.reply_text(
+            f"❌ *{test_id}* ID'li test topilmadi.\nTo'g'ri ID kiriting:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return SUBMIT_TEST_ID
+    if not data["tests"][test_id].get("active"):
+        await update.message.reply_text(
+            f"⚠️ *{test_id}* testi yakunlangan. Boshqa ID kiriting:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return SUBMIT_TEST_ID
+
+    context.user_data['submit_test_id'] = test_id
+    test = data["tests"][test_id]
+    total = len(test["answers"])
+    await update.message.reply_text(
+        f"✅ Test: *{test['name']}*\n"
+        f"📊 Savollar soni: *{total}* ta\n\n"
+        f"3️⃣ Javoblaringizni yuboring:\n"
+        f"📌 Format: `1a2b3c4d5e...`\n"
+        f"_(Har savolga faqat 1 ta harf)_\n\n"
+        f"Misol: `1a2b3d4c5e6b`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return SUBMIT_ANSWERS
+
+async def submit_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Bekor qilish":
+        return await cancel_conv(update, context)
+
     data = load_data()
     user = update.effective_user
     text = update.message.text.strip()
-    
-    # ADMIN HOLATLARI
-    if user.id == data["admin_id"]:
-        state = context.user_data.get('state', '')
-        
-        if state == 'waiting_test_name':
-            context.user_data['test_name'] = text
-            context.user_data['state'] = 'waiting_test_id'
-            await update.message.reply_text(
-                f"✅ Test nomi: *{text}*\n\n"
-                f"2️⃣ Endi test ID'sini yuboring (faqat lotin harflari va raqamlar):\n"
-                f"_(Misol: test1, variant2, huquq_2024)_",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        if state == 'waiting_test_id':
-            test_id = text.lower().replace(" ", "_")
-            if test_id in data["tests"]:
-                await update.message.reply_text(
-                    f"⚠️ Bu ID allaqachon mavjud: *{test_id}*\n"
-                    f"Boshqa ID kiriting:",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            context.user_data['test_id'] = test_id
-            context.user_data['state'] = 'waiting_test_answers'
-            await update.message.reply_text(
-                f"✅ Test ID: *{test_id}*\n\n"
-                f"3️⃣ Endi to'g'ri javoblarni yuboring:\n"
-                f"📌 Format: `1a2b3c4d5e...`\n\n"
-                f"_(Misol: 1a2b3d4c5e6b7a8d9c10b)_",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        if state == 'waiting_test_answers':
-            answers = parse_answers(text)
-            if not answers:
-                await update.message.reply_text(
-                    "❌ Format noto'g'ri! Qaytadan yuboring.\n"
-                    "📌 To'g'ri format: `1a2b3c4d5e`",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            
-            test_id = context.user_data['test_id']
-            test_name = context.user_data['test_name']
-            
-            data["tests"][test_id] = {
-                "name": test_name,
-                "answers": {str(k): v for k, v in answers.items()},
-                "created_at": datetime.now().isoformat(),
-                "active": True
-            }
-            if test_id not in data["results"]:
-                data["results"][test_id] = []
-            save_data(data)
-            
-            context.user_data['state'] = ''
-            
-            formatted = format_answers(answers)
-            await update.message.reply_text(
-                f"✅ *Test muvaffaqiyatli qo'shildi!*\n\n"
-                f"📋 Nom: *{test_name}*\n"
-                f"🔑 ID: `{test_id}`\n"
-                f"📊 Savollar soni: *{len(answers)}* ta\n"
-                f"🗝 Javoblar: `{formatted}`\n\n"
-                f"🟢 Test faol holda. Foydalanuvchilar javob yuborishdi mumkin.\n\n"
-                f"*Kanalda e'lon qilish uchun:*\n"
-                f"```\nJavoblar: {test_id} 1a2b3c...\nBot: @{(await context.bot.get_me()).username}\n```",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Admin buyruqlar kelsa ham foydalanuvchi oqimiga tushmasin
-        if not text.startswith('/'):
-            await update.message.reply_text(
-                "ℹ️ Buyruqlar uchun /help yuboring."
-            )
-        return
-    
-    # ODDIY FOYDALANUVCHI
-    is_subscribed = await check_subscription(user.id, context.bot)
-    if not is_subscribed:
-        await update.message.reply_text(
-            "⚠️ Botdan foydalanish uchun kanalga a'zo bo'ling!",
-            reply_markup=subscription_keyboard()
-        )
-        return
-    
-    # Javob formati: "test_id 1a2b3c..."
-    parts = text.split(None, 1)
-    if len(parts) != 2:
-        await update.message.reply_text(
-            "📌 *Format:* `test_id 1a2b3c4d...`\n\n"
-            "Misol: `test1 1a2b3c4d5e`\n\n"
-            "Faol testlarni ko'rish uchun /start bosing.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-    
-    test_id, answers_text = parts
-    test_id = test_id.lower()
-    
-    if test_id not in data["tests"]:
-        await update.message.reply_text(
-            f"❌ *{test_id}* ID'li test topilmadi.\n\n"
-            f"Faol testlarni ko'rish uchun /start bosing.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-    
+    test_id = context.user_data.get('submit_test_id')
+    fullname = context.user_data.get('submit_fullname')
+
+    if not test_id or test_id not in data["tests"]:
+        await update.message.reply_text("❌ Xato yuz berdi. /start bosing.")
+        return ConversationHandler.END
+
+    # Strict tekshiruv
+    valid, err = validate_answers_strict(text)
+    if not valid:
+        await update.message.reply_text(err, parse_mode=ParseMode.MARKDOWN)
+        return SUBMIT_ANSWERS
+
+    user_answers, err2 = parse_answers(text)
+    if err2:
+        await update.message.reply_text(f"❌ {err2}\n\nQayta yuboring:", parse_mode=ParseMode.MARKDOWN)
+        return SUBMIT_ANSWERS
+
     test = data["tests"][test_id]
-    
-    if not test.get("active"):
-        # Test yakunlangan — xatolarni ko'rsatish mumkin
-        await show_finished_test_results(update, context, data, test_id, user, answers_text)
-        return
-    
-    user_answers = parse_answers(answers_text)
-    if not user_answers:
-        await update.message.reply_text(
-            "❌ Javob formati noto'g'ri!\n"
-            "📌 To'g'ri format: `1a2b3c4d5e`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-    
     correct = {int(k): v for k, v in test["answers"].items()}
     result = calculate_result(correct, user_answers)
-    
-    # Natijani saqlash
+    now = datetime.now().isoformat()
+
     entry = {
         "user_id": user.id,
-        "username": user.username or user.first_name or "Noma'lum",
-        "first_name": user.first_name,
+        "username": user.username or "",
+        "fullname": fullname,
         "answers": {str(k): v for k, v in user_answers.items()},
         "score": result["right"],
-        "date": datetime.now().isoformat()
+        "date": now
     }
-    
-    # Takroriy yuborish oldini olish
-    existing = next((r for r in data["results"].get(test_id, []) if r["user_id"] == user.id), None)
-    if existing:
-        data["results"][test_id].remove(existing)
-    
-    data["results"].setdefault(test_id, []).append(entry)
+
+    # Takroriy yuborish — yangilash
+    results_list = data["results"].get(test_id, [])
+    results_list = [r for r in results_list if r["user_id"] != user.id]
+    results_list.append(entry)
+    data["results"][test_id] = results_list
     save_data(data)
-    
+
     # Foydalanuvchiga javob
     pct = result["percent"]
-    if pct >= 80:
-        emoji = "🏆"
-        grade = "A'lo"
-    elif pct >= 60:
-        emoji = "👍"
-        grade = "Yaxshi"
-    elif pct >= 40:
-        emoji = "📚"
-        grade = "Qoniqarli"
-    else:
-        emoji = "💪"
-        grade = "Qayta o'qing"
-    
-    keyboard = [[InlineKeyboardButton("🔍 Xatolarimni ko'rish", callback_data=f"show_errors:{test_id}")]]
-    # Faqat test yakunlanganda ko'rsatiladi — hozir disabled qilamiz
-    keyboard = []  # Test faol — xatolarni ko'rsatmaymiz
-    
+    emoji = "🏆" if pct>=80 else ("👍" if pct>=60 else ("📚" if pct>=40 else "💪"))
+    grade = "A'lo" if pct>=80 else ("Yaxshi" if pct>=60 else ("Qoniqarli" if pct>=40 else "Qayta o'qing"))
+
+    kb = main_menu_keyboard(user.id, data)
     await update.message.reply_text(
         f"✅ *Javobingiz qabul qilindi!*\n\n"
+        f"👤 {fullname}\n"
         f"📋 Test: *{test['name']}*\n"
         f"📊 Natija: *{result['right']}/{result['total']}* ta to'g'ri\n"
         f"📈 Foiz: *{pct}%*\n"
         f"{emoji} Baho: *{grade}*\n\n"
-        f"🏁 Test yakunlangach xatolaringizni ko'rishingiz mumkin bo'ladi!",
-        parse_mode=ParseMode.MARKDOWN
+        f"🏁 Test yakunlangach xatolaringizni ko'rishingiz mumkin!",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb
     )
 
-async def show_finished_test_results(update, context, data, test_id, user, answers_text=None):
-    """Yakunlangan test uchun foydalanuvchi xatolarini ko'rsatish"""
-    test = data["tests"][test_id]
-    results = data["results"].get(test_id, [])
-    entry = next((r for r in results if r["user_id"] == user.id), None)
-    
-    if not entry:
+    # Test egasiga bildiruv
+    owner_id = test.get("owner_id")
+    if owner_id:
+        try:
+            await context.bot.send_message(
+                chat_id=owner_id,
+                text=f"🔔 *Yangi javob keldi!*\n\n"
+                     f"👤 *{fullname}*\n"
+                     f"📋 Test: *{test['name']}* (`{test_id}`)\n"
+                     f"✅ To'g'ri: *{result['right']}/{result['total']}*\n"
+                     f"📈 Foiz: *{pct}%*\n"
+                     f"🕐 Vaqt: {datetime.fromisoformat(now).strftime('%d.%m.%Y %H:%M')}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            print(f"Egaga xabar yuborishda xato: {e}")
+
+    return ConversationHandler.END
+
+# ===================== MENING TESTLARIM =====================
+async def my_tests_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user = update.effective_user
+    is_sub = await check_subscription(user.id, context.bot)
+    if not is_sub:
+        await update.message.reply_text("⚠️ Kanalga a'zo bo'ling!", reply_markup=sub_keyboard())
+        return
+
+    my = {tid: t for tid, t in data["tests"].items() if t.get("owner_id") == user.id}
+    if not my:
         await update.message.reply_text(
-            f"❌ Siz bu testda qatnashmadingiz yoki test yakunlangan.\n"
-            f"Test ID: *{test_id}*",
+            "📭 Sizda hech qanday test yo'q.\n\n➕ Test qo'shish tugmasini bosing!",
+            reply_markup=main_menu_keyboard(user.id, data)
+        )
+        return
+
+    buttons = []
+    for tid, t in my.items():
+        status = "🟢" if t.get("active") else "🔴"
+        count = len(data["results"].get(tid, []))
+        buttons.append([InlineKeyboardButton(
+            f"{status} {t['name']} ({count} ta javob)",
+            callback_data=f"test_info:{tid}"
+        )])
+
+    await update.message.reply_text(
+        "📋 *Mening testlarim:*\n\nBoshqarish uchun testni tanlang 👇",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def test_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+
+    if query.data == "my_tests":
+        my = {tid: t for tid, t in data["tests"].items() if t.get("owner_id") == query.from_user.id}
+        if not my:
+            await query.edit_message_text("📭 Sizda test yo'q.")
+            return
+        buttons = []
+        for tid, t in my.items():
+            status = "🟢" if t.get("active") else "🔴"
+            count = len(data["results"].get(tid, []))
+            buttons.append([InlineKeyboardButton(
+                f"{status} {t['name']} ({count} ta javob)",
+                callback_data=f"test_info:{tid}"
+            )])
+        await query.edit_message_text(
+            "📋 *Mening testlarim:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    _, test_id = query.data.split(":", 1)
+    test = data["tests"].get(test_id)
+    if not test:
+        await query.edit_message_text("❌ Test topilmadi.")
+        return
+
+    # Faqat egasi boshqara oladi
+    if test.get("owner_id") != query.from_user.id:
+        await query.edit_message_text("❌ Bu test sizniki emas.")
+        return
+
+    count = len(data["results"].get(test_id, []))
+    status = "🟢 Faol" if test.get("active") else "🔴 Yakunlangan"
+    created = test.get("created_at", "")[:10]
+
+    await query.edit_message_text(
+        f"📋 *{test['name']}*\n\n"
+        f"🔑 ID: `{test_id}`\n"
+        f"📊 Savollar: *{len(test['answers'])}* ta\n"
+        f"👥 Javoblar: *{count}* ta\n"
+        f"📍 Holat: {status}\n"
+        f"📅 Yaratilgan: {created}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_test_keyboard(test_id, test.get("active", False))
+    )
+
+async def test_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+
+    action, test_id = query.data.split(":", 1)
+    test = data["tests"].get(test_id)
+    if not test:
+        await query.edit_message_text("❌ Test topilmadi.")
+        return
+    if test.get("owner_id") != query.from_user.id:
+        await query.edit_message_text("❌ Ruxsat yo'q.")
+        return
+
+    results = data["results"].get(test_id, [])
+    correct = {int(k): v for k, v in test["answers"].items()}
+
+    if action == "end":
+        data["tests"][test_id]["active"] = False
+        save_data(data)
+        count = len(results)
+        await query.edit_message_text(
+            f"✅ *{test['name']}* yakunlandi!\n\n"
+            f"👥 Jami {count} ta ishtirokchi\n\n"
+            f"Statistikani olish uchun testni qayta oching 👆",
             parse_mode=ParseMode.MARKDOWN
         )
-        return
-    
-    correct = {int(k): v for k, v in test["answers"].items()}
-    user_ans = {int(k): v for k, v in entry["answers"].items()}
-    result = calculate_result(correct, user_ans)
-    
-    error_text = ""
-    if result["wrong"]:
-        errors = "\n".join([
-            f"  ❌ {num}-savol: Siz *{u.upper()}*, To'g'ri: *{c.upper()}*"
-            for num, u, c in sorted(result["wrong"])
-        ])
-        error_text = f"\n\n🔴 *Xatolaringiz:*\n{errors}"
-    
-    if result["missing"]:
-        missing = ", ".join(str(n) for n in sorted(result["missing"]))
-        error_text += f"\n\n⚠️ *Javob berilmagan:* {missing}"
-    
-    if not result["wrong"] and not result["missing"]:
-        error_text = "\n\n🎉 *Barcha javoblar to'g'ri!*"
-    
-    await update.message.reply_text(
-        f"📊 *Test yakunlandi — Natijangiz*\n\n"
-        f"📋 Test: *{test['name']}*\n"
-        f"✅ To'g'ri: *{result['right']}/{result['total']}*\n"
-        f"📈 Foiz: *{result['percent']}%*"
-        f"{error_text}",
-        parse_mode=ParseMode.MARKDOWN
-    )
 
-async def show_errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    _, test_id = query.data.split(":", 1)
-    data = load_data()
-    user = query.from_user
-    
-    test = data["tests"].get(test_id)
-    if not test or test.get("active"):
-        await query.edit_message_text("⏳ Test hali yakunlanmagan. Kuting!")
-        return
-    
-    results = data["results"].get(test_id, [])
-    entry = next((r for r in results if r["user_id"] == user.id), None)
-    
-    if not entry:
-        await query.edit_message_text("❌ Siz bu testda qatnashmadingiz.")
-        return
-    
-    correct = {int(k): v for k, v in test["answers"].items()}
-    user_ans = {int(k): v for k, v in entry["answers"].items()}
-    result = calculate_result(correct, user_ans)
-    
-    error_lines = ""
-    if result["wrong"]:
-        error_lines = "\n".join([
-            f"❌ {num}-savol: Siz *{u.upper()}*, To'g'ri: *{c.upper()}*"
-            for num, u, c in sorted(result["wrong"])
-        ])
-    else:
-        error_lines = "🎉 Barcha javoblar to'g'ri!"
-    
-    if result["missing"]:
-        error_lines += f"\n\n⚠️ Javob berilmagan: {', '.join(str(n) for n in sorted(result['missing']))}"
-    
-    await query.edit_message_text(
-        f"🔍 *Xatolaringiz — {test['name']}*\n\n"
-        f"✅ To'g'ri: *{result['right']}/{result['total']}* ({result['percent']}%)\n\n"
-        f"{error_lines}",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-# ===================== ADMIN: TESTLAR RO'YXATI =====================
-
-async def tests_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    if update.effective_user.id != data["admin_id"]:
-        return
-    
-    if not data["tests"]:
-        await update.message.reply_text("📭 Hech qanday test yo'q.")
-        return
-    
-    text = "📋 *Barcha testlar:*\n\n"
-    for tid, t in data["tests"].items():
-        status = "🟢 Faol" if t.get("active") else "🔴 Yakunlangan"
-        count = len(data["results"].get(tid, []))
-        text += (
-            f"🔹 *{t['name']}*\n"
-            f"   ID: `{tid}` | {status} | 👥 {count} ta javob\n"
-            f"   📅 {t['created_at'][:10]}\n\n"
-        )
-    
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-# ===================== ADMIN: TEST YAKUNLASH =====================
-
-async def endtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    if update.effective_user.id != data["admin_id"]:
-        return
-    
-    active = {tid: t for tid, t in data["tests"].items() if t.get("active")}
-    if not active:
-        await update.message.reply_text("❌ Yakunlash uchun faol test yo'q.")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton(f"🏁 {t['name']}", callback_data=f"endtest:{tid}")]
-        for tid, t in active.items()
-    ]
-    keyboard.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")])
-    
-    await update.message.reply_text(
-        "🏁 *Qaysi testni yakunlamoqchisiz?*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def endtest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "cancel":
-        await query.edit_message_text("❌ Bekor qilindi.")
-        return
-    
-    _, test_id = query.data.split(":", 1)
-    data = load_data()
-    
-    if update.effective_user.id != data["admin_id"]:
-        return
-    
-    data["tests"][test_id]["active"] = False
-    save_data(data)
-    
-    count = len(data["results"].get(test_id, []))
-    test_name = data["tests"][test_id]["name"]
-    
-    await query.edit_message_text(
-        f"✅ *{test_name}* — test yakunlandi!\n\n"
-        f"👥 Jami {count} ta ishtirokchi\n\n"
-        f"📊 Statistikani olish uchun:\n"
-        f"/stats — PDF ko'rinishida\n"
-        f"/statstext — Matn ko'rinishida",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-# ===================== ADMIN: STATISTIKA =====================
-
-async def stats_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    if update.effective_user.id != data["admin_id"]:
-        return
-    
-    # Test tanlash
-    if not data["tests"]:
-        await update.message.reply_text("📭 Testlar yo'q.")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton(f"📊 {t['name']}", callback_data=f"statspdf:{tid}")]
-        for tid, t in data["tests"].items()
-    ]
-    
-    await update.message.reply_text(
-        "📊 *Qaysi test statistikasini PDF ko'rinishida olmoqchisiz?*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def stats_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    if update.effective_user.id != data["admin_id"]:
-        return
-    
-    if not data["tests"]:
-        await update.message.reply_text("📭 Testlar yo'q.")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton(f"📝 {t['name']}", callback_data=f"statstext:{tid}")]
-        for tid, t in data["tests"].items()
-    ]
-    
-    await update.message.reply_text(
-        "📝 *Qaysi test statistikasini matn ko'rinishida olmoqchisiz?*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("⏳ Tayyorlanmoqda...")
-    
-    data = load_data()
-    
-    if query.data.startswith("statspdf:"):
-        test_id = query.data.split(":", 1)[1]
-        test = data["tests"].get(test_id)
-        results = data["results"].get(test_id, [])
-        
+    elif action == "pdf":
         if not results:
-            await query.edit_message_text("📭 Bu test uchun natijalar yo'q.")
+            await query.edit_message_text("📭 Hech qanday natija yo'q.")
             return
-        
         await query.edit_message_text("⏳ PDF tayyorlanmoqda...")
-        
-        correct = {int(k): v for k, v in test["answers"].items()}
         pdf_bytes = generate_pdf(test["name"], results, correct)
-        
-        filename = f"statistika_{test_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-        
+        fname = f"statistika_{test_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
         await context.bot.send_document(
             chat_id=query.message.chat_id,
             document=io.BytesIO(pdf_bytes),
-            filename=filename,
-            caption=f"📊 *{test['name']}* — statistika\n👥 {len(results)} ta ishtirokchi",
+            filename=fname,
+            caption=f"📊 *{test['name']}*\n👥 {len(results)} ta ishtirokchi",
             parse_mode=ParseMode.MARKDOWN
         )
         await query.delete_message()
-    
-    elif query.data.startswith("statstext:"):
-        test_id = query.data.split(":", 1)[1]
-        test = data["tests"].get(test_id)
-        results = data["results"].get(test_id, [])
-        correct = {int(k): v for k, v in test["answers"].items()}
-        
+
+    elif action == "txt":
         if not results:
-            await query.edit_message_text("📭 Bu test uchun natijalar yo'q.")
+            await query.edit_message_text("📭 Hech qanday natija yo'q.")
             return
-        
-        sorted_r = sorted(results, key=lambda x: x['score'], reverse=True)
         total_q = len(correct)
-        
-        text = f"📊 *{test['name']}* — Statistika\n"
-        text += f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-        text += f"─────────────────────\n"
-        text += f"👥 Ishtirokchilar: *{len(results)}* ta\n"
-        
-        if results:
-            scores = [r['score'] for r in results]
-            text += f"📈 O'rtacha ball: *{round(sum(scores)/len(scores),1)}/{total_q}*\n"
-            text += f"🏆 Eng yuqori: *{max(scores)}/{total_q}*\n"
-            text += f"📉 Eng past: *{min(scores)}/{total_q}*\n"
-        
-        text += f"─────────────────────\n\n"
-        text += f"🏅 *Natijalar ro'yxati:*\n"
-        
+        sorted_r = sorted(results, key=lambda x: (-x['score'], x.get('date','')))
+        scores = [r['score'] for r in results]
+        text = (
+            f"📊 *{test['name']}* — Statistika\n"
+            f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"─────────────────────\n"
+            f"👥 Ishtirokchi: *{len(results)}*\n"
+            f"📈 O'rtacha: *{round(sum(scores)/len(scores),1)}/{total_q}*\n"
+            f"🏆 Yuqori: *{max(scores)}/{total_q}*\n"
+            f"📉 Past: *{min(scores)}/{total_q}*\n"
+            f"─────────────────────\n\n"
+        )
         for i, r in enumerate(sorted_r, 1):
             medal = {1:'🥇',2:'🥈',3:'🥉'}.get(i, f"{i}.")
-            name = r.get('username') or r.get('first_name') or "Noma'lum"
-            pct = round(r['score']/total_q*100,1) if total_q > 0 else 0
-            text += f"{medal} *{name}* — {r['score']}/{total_q} ({pct}%)\n"
-        
+            pct = round(r['score']/total_q*100,1) if total_q>0 else 0
+            try:
+                vaqt = datetime.fromisoformat(r['date']).strftime('%d.%m %H:%M')
+            except:
+                vaqt = ''
+            text += f"{medal} *{r.get('fullname','?')}* — {r['score']}/{total_q} ({pct}%) | {vaqt}\n"
+
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
 
-# ===================== ADMIN: O'CHIRISH =====================
+    elif action == "del":
+        # Tasdiqlash
+        await query.edit_message_text(
+            f"⚠️ *{test['name']}* testini o'chirishni tasdiqlaysizmi?\n\n"
+            f"Bu amal qaytarilmaydi!",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Ha, o'chir", callback_data=f"delconfirm:{test_id}")],
+                [InlineKeyboardButton("❌ Yo'q", callback_data=f"test_info:{test_id}")]
+            ])
+        )
 
-async def deletetest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    if update.effective_user.id != data["admin_id"]:
-        return
-    
-    if not data["tests"]:
-        await update.message.reply_text("📭 Testlar yo'q.")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton(f"🗑 {t['name']}", callback_data=f"deltest:{tid}")]
-        for tid, t in data["tests"].items()
-    ]
-    keyboard.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")])
-    
-    await update.message.reply_text(
-        "🗑 *Qaysi testni o'chirmoqchisiz?*\n"
-        "⚠️ Bu amal qaytarilmaydi!",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def deltest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def del_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    if query.data == "cancel":
-        await query.edit_message_text("❌ Bekor qilindi.")
-        return
-    
     _, test_id = query.data.split(":", 1)
     data = load_data()
-    
-    if update.effective_user.id != data["admin_id"]:
+    test = data["tests"].get(test_id)
+    if not test or test.get("owner_id") != query.from_user.id:
+        await query.edit_message_text("❌ Ruxsat yo'q.")
         return
-    
-    test_name = data["tests"][test_id]["name"]
+    name = test["name"]
     del data["tests"][test_id]
     if test_id in data["results"]:
         del data["results"][test_id]
     save_data(data)
-    
-    await query.edit_message_text(f"✅ *{test_name}* test o'chirildi.", parse_mode=ParseMode.MARKDOWN)
+    await query.edit_message_text(f"✅ *{name}* o'chirildi.", parse_mode=ParseMode.MARKDOWN)
 
-# ===================== HELP =====================
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== XATOLARNI KO'RISH (yakunlangan test) =====================
+async def show_my_errors_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi yakunlangan testda xatolarini ko'rish"""
     data = load_data()
-    is_admin = update.effective_user.id == data["admin_id"]
-    
-    if is_admin:
-        text = (
-            "📖 *Admin Yordam*\n\n"
-            "➕ /addtest — Yangi test qo'shish\n"
-            "   _Bosqichma-bosqich: nom → ID → javoblar_\n\n"
-            "📋 /tests — Barcha testlar ro'yxati\n\n"
-            "🏁 /endtest — Testni yakunlash\n"
-            "   _Yakunlangach foydalanuvchilar xatolarini ko'ra oladi_\n\n"
-            "📊 /stats — PDF statistika\n\n"
-            "📝 /statstext — Matn statistika\n\n"
-            "🗑 /deletetest — Testni o'chirish\n\n"
-            "📌 *Javob formati:* `1a2b3c4d5e...`\n"
-            "_(raqam + harf, ketma-ket)_"
+    user = update.effective_user
+    # Foydalanuvchi qatnashgan yakunlangan testlar
+    finished = []
+    for tid, t in data["tests"].items():
+        if not t.get("active"):
+            results = data["results"].get(tid, [])
+            entry = next((r for r in results if r["user_id"] == user.id), None)
+            if entry:
+                finished.append((tid, t, entry))
+    if not finished:
+        await update.message.reply_text(
+            "📭 Siz qatnashgan yakunlangan test yo'q.",
+            reply_markup=main_menu_keyboard(user.id, data)
         )
+        return
+    buttons = [
+        [InlineKeyboardButton(f"📋 {t['name']}", callback_data=f"myerr:{tid}")]
+        for tid, t, _ in finished
+    ]
+    await update.message.reply_text(
+        "🔍 Qaysi testdagi xatolaringizni ko'rmoqchisiz?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def my_errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, test_id = query.data.split(":", 1)
+    data = load_data()
+    test = data["tests"].get(test_id)
+    results = data["results"].get(test_id, [])
+    entry = next((r for r in results if r["user_id"] == query.from_user.id), None)
+    if not entry:
+        await query.edit_message_text("❌ Siz bu testda qatnashmadingiz.")
+        return
+    correct = {int(k): v for k, v in test["answers"].items()}
+    user_ans = {int(k): v for k, v in entry["answers"].items()}
+    result = calculate_result(correct, user_ans)
+    error_text = ""
+    if result["wrong"]:
+        lines = "\n".join([f"❌ {n}-savol: Siz *{u.upper()}*, To'g'ri: *{c.upper()}*"
+                           for n, u, c in sorted(result["wrong"])])
+        error_text = f"\n\n🔴 *Xatolaringiz:*\n{lines}"
+    if result["missing"]:
+        error_text += f"\n\n⚠️ Javob berilmagan: {', '.join(str(n) for n in sorted(result['missing']))}"
+    if not result["wrong"] and not result["missing"]:
+        error_text = "\n\n🎉 Barcha javoblar to'g'ri edi!"
+    await query.edit_message_text(
+        f"📊 *{test['name']}* — Natijangiz\n\n"
+        f"👤 {entry.get('fullname','')}\n"
+        f"✅ To'g'ri: *{result['right']}/{result['total']}* ({result['percent']}%)"
+        f"{error_text}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ===================== YORDAM =====================
+async def help_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    await update.message.reply_text(
+        "ℹ️ *Yordam*\n\n"
+        "📝 *Testga javob berish:*\n"
+        "   Ism-familiya → Test ID → Javoblar\n\n"
+        "➕ *Test qo'shish:*\n"
+        "   Nom → ID → `1a2b3c...` javoblar\n\n"
+        "📋 *Mening testlarim:*\n"
+        "   Statistika, yakunlash, o'chirish\n\n"
+        "📌 *Javob formati:* `1a2b3c4d5e`\n"
+        "_(raqam + 1 ta harf, ketma-ket)_\n\n"
+        f"📢 Kanal: {CHANNEL_LINK}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_keyboard(update.effective_user.id, data)
+    )
+
+# ===================== MAIN HANDLER (tugmalar) =====================
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    data = load_data()
+    user = update.effective_user
+
+    is_sub = await check_subscription(user.id, context.bot)
+    if not is_sub:
+        await update.message.reply_text("⚠️ Botdan foydalanish uchun kanalga a'zo bo'ling!", reply_markup=sub_keyboard())
+        return
+
+    if text == "📋 Mening testlarim":
+        await my_tests_menu(update, context)
+    elif text == "ℹ️ Yordam":
+        await help_msg(update, context)
+    elif text == "🔍 Xatolarimni ko'rish":
+        await show_my_errors_flow(update, context)
     else:
-        text = (
-            "📖 *Yordam*\n\n"
-            "✍️ *Javob yuborish:*\n"
-            "`test_id 1a2b3c4d5e`\n\n"
-            "📌 *Misol:*\n"
-            "`huquq1 1a2b3d4c5e6b`\n\n"
-            "🔹 test_id — admin e'lon qilgan ID\n"
-            "🔹 Keyin javoblar: raqam + harf\n\n"
-            "🏁 Test yakunlangach xatolaringizni ko'rishingiz mumkin."
+        await update.message.reply_text(
+            "Tugmalardan foydalaning 👇",
+            reply_markup=main_menu_keyboard(user.id, data)
         )
-    
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 # ===================== MAIN =====================
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Handlers
+
+    # Test qo'shish conversation
+    add_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➕ Test qo'shish$"), add_test_start)],
+        states={
+            ADD_TEST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_test_name)],
+            ADD_TEST_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_test_id)],
+            ADD_TEST_ANSWERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_test_answers)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv),
+                   MessageHandler(filters.Regex("^❌ Bekor qilish$"), cancel_conv)],
+    )
+
+    # Javob berish conversation
+    submit_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📝 Testga javob berish$"), submit_start)],
+        states={
+            SUBMIT_FULLNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, submit_fullname)],
+            SUBMIT_TEST_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, submit_test_id)],
+            SUBMIT_ANSWERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, submit_answers)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv),
+                   MessageHandler(filters.Regex("^❌ Bekor qilish$"), cancel_conv)],
+    )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addtest", addtest))
-    app.add_handler(CommandHandler("tests", tests_list))
-    app.add_handler(CommandHandler("endtest", endtest))
-    app.add_handler(CommandHandler("stats", stats_pdf))
-    app.add_handler(CommandHandler("statstext", stats_text))
-    app.add_handler(CommandHandler("deletetest", deletetest))
-    app.add_handler(CommandHandler("help", help_command))
-    
+    app.add_handler(CommandHandler("cancel", cancel_conv))
+    app.add_handler(add_conv)
+    app.add_handler(submit_conv)
+
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
-    app.add_handler(CallbackQueryHandler(endtest_callback, pattern="^endtest:"))
-    app.add_handler(CallbackQueryHandler(stats_callback, pattern="^statspdf:"))
-    app.add_handler(CallbackQueryHandler(stats_callback, pattern="^statstext:"))
-    app.add_handler(CallbackQueryHandler(deltest_callback, pattern="^deltest:"))
-    app.add_handler(CallbackQueryHandler(show_errors_callback, pattern="^show_errors:"))
-    app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.edit_message_text("❌ Bekor qilindi."), pattern="^cancel$"))
-    
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("🤖 Test Bot ishga tushdi!")
+    app.add_handler(CallbackQueryHandler(test_info_callback, pattern="^test_info:"))
+    app.add_handler(CallbackQueryHandler(test_info_callback, pattern="^my_tests$"))
+    app.add_handler(CallbackQueryHandler(test_action_callback, pattern="^(end|pdf|txt|del):"))
+    app.add_handler(CallbackQueryHandler(del_confirm_callback, pattern="^delconfirm:"))
+    app.add_handler(CallbackQueryHandler(my_errors_callback, pattern="^myerr:"))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_handler))
+
+    print("🤖 Bot ishga tushdi!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
