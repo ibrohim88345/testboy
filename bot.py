@@ -2,7 +2,7 @@ import os
 import json
 import re
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ChatMember, ReplyKeyboardMarkup, KeyboardButton
@@ -26,6 +26,24 @@ CHANNEL_ID   = -1002847480970   # Kanal numeric ID (ishonchliroq)
 CHANNEL_USER = "@huquqologiyauz"
 CHANNEL_LINK = "https://t.me/huquqologiyauz"
 DATA_FILE    = "data.json"
+
+# O'zbekiston vaqt zonasi: UTC+5
+UZT = timezone(timedelta(hours=5))
+
+def now_uzt() -> datetime:
+    return datetime.now(UZT)
+
+def fmt_uzt(iso_str: str) -> str:
+    """ISO string ni O'zbekiston vaqtida DD.MM.YYYY HH:MM:SS formatida qaytaradi"""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UZT)
+        else:
+            dt = dt.astimezone(UZT)
+        return dt.strftime('%d.%m.%Y %H:%M:%S')
+    except:
+        return iso_str[:19]
 
 # ===================== DATA =====================
 def load_data():
@@ -136,7 +154,7 @@ def make_pdf(test_name, results, correct):
 
     # Sarlavha
     hdr = Table([[Paragraph(f"📊 {test_name}", ts)],
-                 [Paragraph(datetime.now().strftime('%d.%m.%Y %H:%M'), ss)]],
+                 [Paragraph(now_uzt().strftime('%d.%m.%Y %H:%M:%S'), ss)]],
                 colWidths=[18*cm])
     hdr.setStyle(TableStyle([
         ('BACKGROUND',(0,0),(-1,-1),PRI),
@@ -175,7 +193,7 @@ def make_pdf(test_name, results, correct):
     for i, r in enumerate(srt, 1):
         med = {1:'🥇',2:'🥈',3:'🥉'}.get(i, str(i))
         pct = round(r['score']/tq*100,1) if tq else 0
-        try:    vt = datetime.fromisoformat(r['date']).strftime('%d.%m %H:%M')
+        try:    vt = fmt_uzt(r['date'])
         except: vt = ''
         td.append([med, r.get('fullname','?')[:24], str(r['score']),
                    str(tq-r['score']), f"{r['score']}/{tq}", f"{pct}%", vt])
@@ -225,7 +243,7 @@ def make_pdf(test_name, results, correct):
         story.append(at)
 
     story += [Spacer(1,.4*cm)]
-    ft = Table([[f"© {datetime.now().year} | {CHANNEL_USER} | {datetime.now().strftime('%d.%m.%Y %H:%M')}"]],
+    ft = Table([[f"© {now_uzt().year} | {CHANNEL_USER} | {now_uzt().strftime('%d.%m.%Y %H:%M:%S')}"]],
                colWidths=[18*cm])
     ft.setStyle(TableStyle([
         ('BACKGROUND',(0,0),(-1,-1),PRI),('TEXTCOLOR',(0,0),(-1,-1),colors.HexColor('#c5cae9')),
@@ -239,12 +257,19 @@ def make_pdf(test_name, results, correct):
 # ===================== KLAVIATURALAR =====================
 def main_kb(uid, data):
     has_tests = any(t.get("owner_id")==uid for t in data["tests"].values())
+    # Foydalanuvchi qatnashgan test bormi
+    has_results = any(
+        any(r["user_id"] == uid for r in data["results"].get(tid, []))
+        for tid in data["tests"]
+    )
     rows = [
         [KeyboardButton("📝 Testga javob berish")],
         [KeyboardButton("➕ Test qo'shish")],
     ]
     if has_tests:
         rows.append([KeyboardButton("📋 Mening testlarim")])
+    if has_results:
+        rows.append([KeyboardButton("🔍 Natijalarim va xatolarim")])
     rows.append([KeyboardButton("ℹ️ Yordam")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -387,7 +412,7 @@ async def handle_add_answers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data["tests"][tid] = {
         "name": st["name"],
         "answers": {str(k): v for k, v in answers.items()},
-        "created_at": datetime.now().isoformat(),
+        "created_at": now_uzt().isoformat(),
         "active": True,
         "owner_id": uid
     }
@@ -482,7 +507,7 @@ async def handle_sub_answers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     correct = {int(k): v for k, v in test["answers"].items()}
     res = calc(correct, answers)
-    now = datetime.now().isoformat()
+    now = now_uzt().isoformat()
     entry = {
         "user_id": uid,
         "username": update.effective_user.username or "",
@@ -511,17 +536,42 @@ async def handle_sub_answers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_kb(uid, data)
     )
-    # Egaga bildiruv
+    # Egaga bildiruv — har bir savol tekshirilgan holda
     owner = test.get("owner_id")
     if owner:
         try:
+            # Har bir javobni to'g'ri/xato belgilab ko'rsatish
+            detail_lines = []
+            for num in sorted(correct.keys()):
+                c_ans = correct[num]
+                u_ans = answers.get(num)
+                if u_ans is None:
+                    detail_lines.append(f"⚪️ {num}: — (javob berilmadi)")
+                elif u_ans == c_ans:
+                    detail_lines.append(f"✅ {num}: {u_ans.upper()}")
+                else:
+                    detail_lines.append(f"❌ {num}: {u_ans.upper()} (to'g'ri: {c_ans.upper()})")
+            # Uzun bo'lsa ixchamlashtir
+            if len(detail_lines) > 30:
+                # Faqat xatolarni ko'rsat
+                wrong_lines = [l for l in detail_lines if l.startswith("❌") or l.startswith("⚪️")]
+                detail_txt = (
+                    f"✅ To'g'rilar: {res['right']} ta\n"
+                    f"❌ Xatolar ({len(wrong_lines)} ta):\n" +
+                    "\n".join(wrong_lines)
+                )
+            else:
+                detail_txt = "\n".join(detail_lines)
+
             await ctx.bot.send_message(
                 chat_id=owner,
-                text=f"🔔 *Yangi javob!*\n\n"
+                text=f"🔔 *Yangi javob keldi!*\n\n"
                      f"👤 *{fn}*\n"
                      f"📋 *{test['name']}* (`{tid}`)\n"
-                     f"✅ To'g'ri: *{res['right']}/{res['total']}* ({pct}%)\n"
-                     f"🕐 {datetime.fromisoformat(now).strftime('%d.%m.%Y %H:%M')}",
+                     f"📊 Natija: *{res['right']}/{res['total']}* ({pct}%)\n"
+                     f"🕐 {fmt_uzt(now)}\n\n"
+                     f"*Javoblar tahlili:*\n"
+                     f"{detail_txt}",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
@@ -626,7 +676,7 @@ async def cb_test_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await q.edit_message_text("⏳ PDF tayyorlanmoqda...")
         pdf = make_pdf(test["name"], results, correct)
-        fname = f"stat_{tid}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+        fname = f"stat_{tid}_{now_uzt().strftime('%Y%m%d_%H%M')}.pdf"
         await ctx.bot.send_document(
             chat_id=q.message.chat_id,
             document=io.BytesIO(pdf), filename=fname,
@@ -644,7 +694,7 @@ async def cb_test_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         scores = [r['score'] for r in results]
         text = (
             f"📊 *{test['name']}*\n"
-            f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"📅 {now_uzt().strftime('%d.%m.%Y %H:%M:%S')}\n"
             f"─────────────────────\n"
             f"👥 Ishtirokchi: *{len(results)}*\n"
             f"📈 O'rtacha: *{round(sum(scores)/len(scores),1)}/{tq}*\n"
@@ -655,7 +705,7 @@ async def cb_test_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for i, r in enumerate(srt, 1):
             med = {1:'🥇',2:'🥈',3:'🥉'}.get(i, f"{i}.")
             pct = round(r['score']/tq*100,1) if tq else 0
-            try:    vt = datetime.fromisoformat(r['date']).strftime('%d.%m %H:%M')
+            try:    vt = fmt_uzt(r['date'])
             except: vt = ''
             text += f"{med} *{r.get('fullname','?')}* — {r['score']}/{tq} ({pct}%) | {vt}\n"
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -691,18 +741,28 @@ async def show_errors_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await require_sub(update, ctx.bot): return
     data = load_data()
-    done = [(tid, t) for tid, t in data["tests"].items()
-            if not t.get("active") and
-            any(r["user_id"] == uid for r in data["results"].get(tid, []))]
-    if not done:
+    # Foydalanuvchi qatnashgan BARCHA testlar (faol yoki yakunlangan)
+    participated = [
+        (tid, t) for tid, t in data["tests"].items()
+        if any(r["user_id"] == uid for r in data["results"].get(tid, []))
+    ]
+    if not participated:
         await update.message.reply_text(
-            "📭 Siz qatnashgan yakunlangan test yo'q.",
+            "📭 Siz hali hech qanday testga javob bermadingiz.",
             reply_markup=main_kb(uid, data)
         )
         return
-    btns = [[InlineKeyboardButton(f"📋 {t['name']}", callback_data=f"myerr:{tid}")] for tid, t in done]
+    btns = []
+    for tid, t in participated:
+        status = "🟢" if t.get("active") else "🔴"
+        label = f"{status} {t['name']}"
+        if t.get("active"):
+            label += " (faol — natija yakunlangach)"
+        btns.append([InlineKeyboardButton(label, callback_data=f"myerr:{tid}")])
     await update.message.reply_text(
-        "🔍 Qaysi testdagi xatolaringizni ko'rmoqchisiz?",
+        "🔍 Qaysi testdagi natijangizni ko'rmoqchisiz?\n\n"
+        "🟢 Faol testlarda xatolar test yakunlangach ko'rinadi\n"
+        "🔴 Yakunlangan testlarda xatolarni ko'rishingiz mumkin",
         reply_markup=InlineKeyboardMarkup(btns)
     )
 
@@ -712,30 +772,68 @@ async def cb_my_errors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _, tid = q.data.split(":", 1)
     data = load_data()
     test = data["tests"].get(tid)
+    if not test:
+        await q.edit_message_text("❌ Test topilmadi.")
+        return
     results = data["results"].get(tid, [])
     entry = next((r for r in results if r["user_id"] == q.from_user.id), None)
     if not entry:
         await q.edit_message_text("❌ Siz bu testda qatnashmadingiz.")
         return
+    # Faol test bo'lsa — faqat natijani ko'rsat, xatolarni emas
+    if test.get("active"):
+        pct = round(entry['score'] / len(test['answers']) * 100, 1) if test['answers'] else 0
+        try: vt = fmt_uzt(entry['date'])
+        except: vt = entry.get('date','')
+        await q.edit_message_text(
+            f"📊 *{test['name']}*\n\n"
+            f"👤 {entry.get('fullname','')}\n"
+            f"✅ Natija: *{entry['score']}/{len(test['answers'])}* ({pct}%)\n"
+            f"🕐 Yuborilgan: {vt}\n\n"
+            f"⏳ Test hali faol — xatolar test yakunlangach ko'rinadi.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    # Yakunlangan test — xatolarni to'liq ko'rsat
     correct = {int(k): v for k, v in test["answers"].items()}
     user_ans = {int(k): v for k, v in entry["answers"].items()}
     res = calc(correct, user_ans)
-    err_txt = ""
-    if res["wrong"]:
-        err_txt = "\n\n🔴 *Xatolaringiz:*\n" + "\n".join(
-            [f"❌ {n}-savol: Siz *{u.upper()}*, To'g'ri: *{c.upper()}*" for n,u,c in sorted(res["wrong"])]
-        )
-    if res["missing"]:
-        err_txt += f"\n\n⚠️ Javob berilmagan: {', '.join(str(n) for n in sorted(res['missing']))}"
-    if not res["wrong"] and not res["missing"]:
-        err_txt = "\n\n🎉 Barcha javoblar to'g'ri edi!"
-    await q.edit_message_text(
+    try: vt = fmt_uzt(entry['date'])
+    except: vt = entry.get('date','')
+
+    # Har bir savol bo'yicha tahlil
+    detail_lines = []
+    for num in sorted(correct.keys()):
+        c_ans = correct[num]
+        u_ans = user_ans.get(num)
+        if u_ans is None:
+            detail_lines.append(f"⚪️ {num}: javob berilmagan (to'g'ri: *{c_ans.upper()}*)")
+        elif u_ans == c_ans:
+            detail_lines.append(f"✅ {num}: *{u_ans.upper()}*")
+        else:
+            detail_lines.append(f"❌ {num}: *{u_ans.upper()}* → to'g'ri: *{c_ans.upper()}*")
+
+    detail_txt = "\n".join(detail_lines)
+
+    # Telegram 4096 belgi chegarasi — kerak bo'lsa qisqartir
+    header = (
         f"📊 *{test['name']}* — Natijangiz\n\n"
         f"👤 {entry.get('fullname','')}\n"
-        f"✅ To'g\'ri: *{res['right']}/{res['total']}* ({res['percent']}%)"
-        f"{err_txt}",
-        parse_mode=ParseMode.MARKDOWN
+        f"✅ To'g'ri: *{res['right']}/{res['total']}* ({res['percent']}%)\n"
+        f"🕐 Yuborilgan: {vt}\n\n"
+        f"*Batafsil tahlil:*\n"
     )
+    full_msg = header + detail_txt
+    if len(full_msg) > 4000:
+        # Faqat xatolarni ko'rsat
+        wrong_lines = [l for l in detail_lines if l.startswith("❌") or l.startswith("⚪️")]
+        if wrong_lines:
+            full_msg = header + "\n".join(wrong_lines) + f"\n\n_✅ To'g'ri javoblar: {res['right']} ta ko'rsatilmadi_"
+        else:
+            full_msg = header + "🎉 Barcha javoblar to'g'ri edi!"
+    if not res["wrong"] and not res["missing"]:
+        full_msg = header + "🎉 Barcha javoblar to'g'ri edi!"
+    await q.edit_message_text(full_msg, parse_mode=ParseMode.MARKDOWN)
 
 # ===================== YORDAM =====================
 async def show_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -794,7 +892,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_my_tests(update, ctx)
     elif text == "ℹ️ Yordam":
         await show_help(update, ctx)
-    elif text == "🔍 Xatolarimni ko'rish":
+    elif text in ("🔍 Xatolarimni ko'rish", "🔍 Natijalarim va xatolarim"):
         await show_errors_menu(update, ctx)
     else:
         if not await require_sub(update, ctx.bot): return
