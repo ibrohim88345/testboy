@@ -480,13 +480,37 @@ async def handle_sub_test_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not data["tests"][tid].get("active"):
         await update.message.reply_text(f"⚠️ `{tid}` testi yakunlangan. Boshqa ID kiriting:", parse_mode=ParseMode.MARKDOWN)
         return
+
+    # BITTA MARTA YUBORISH CHEKLOVI: user_id bo'yicha — ism o'zgartirsa ham aniqlanadi
+    existing = next((r for r in data["results"].get(tid, []) if r["user_id"] == uid), None)
+    if existing:
+        clear_state(uid)
+        test = data["tests"][tid]
+        tq = len(test["answers"])
+        pct = round(existing['score']/tq*100, 1) if tq else 0
+        try: vt = fmt_uzt(existing['date'])
+        except: vt = existing.get('date','')
+        await update.message.reply_text(
+            f"⛔️ *Siz bu testga allaqachon javob yuborgansiz!*\n\n"
+            f"📋 Test: *{test['name']}*\n"
+            f"👤 {existing.get('fullname','')}\n"
+            f"✅ Natijangiz: *{existing['score']}/{tq}* ({pct}%)\n"
+            f"🕐 Yuborilgan: {vt}\n\n"
+            f"⚠️ Har bir test uchun faqat *1 marta* javob yuborish mumkin. "
+            f"Qayta urinish (ism o'zgartirib bo'lsa ham) qabul qilinmaydi.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_kb(uid, data)
+        )
+        return
+
     test = data["tests"][tid]
     set_state(uid, "sub_answers", fullname=st["fullname"], tid=tid)
     await update.message.reply_text(
         f"✅ Test: *{test['name']}*\n"
         f"📊 Savollar: *{len(test['answers'])}* ta\n\n"
         "3️⃣ Javoblaringizni yuboring:\n"
-        "📌 Format: `1a2b3c4d5e...`",
+        "📌 Format: `1a2b3c4d5e...`\n\n"
+        "⚠️ *Diqqat:* Faqat 1 marta javob yuborishingiz mumkin!",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -501,6 +525,17 @@ async def handle_sub_answers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Test topilmadi. /start bosing.")
         clear_state(uid)
         return
+
+    # Qayta tekshiruv: javob yozish jarayonida boshqa joydan/parallel yuborgan bo'lishi mumkin
+    existing = next((r for r in data["results"].get(tid, []) if r["user_id"] == uid), None)
+    if existing:
+        clear_state(uid)
+        await update.message.reply_text(
+            "⛔️ Siz bu testga allaqachon javob yuborgansiz. Qayta yuborish mumkin emas.",
+            reply_markup=main_kb(uid, data)
+        )
+        return
+
     answers, err = parse_answers(update.message.text)
     if err:
         await update.message.reply_text(err + "\n\nQayta yuboring:", parse_mode=ParseMode.MARKDOWN)
@@ -516,7 +551,8 @@ async def handle_sub_answers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "score": res["right"],
         "date": now
     }
-    lst = [r for r in data["results"].get(tid, []) if r["user_id"] != uid]
+    # Faqat birinchi marta qo'shiladi — qayta yozilmaydi
+    lst = data["results"].get(tid, [])
     lst.append(entry)
     data["results"][tid] = lst
     save_data(data)
