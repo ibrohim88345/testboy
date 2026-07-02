@@ -25,7 +25,9 @@ BOT_TOKEN = "8950300608:AAGKzpg2uIyKlijdgO7JhdMZLpo2nYIuHzo"
 CHANNEL_ID   = -1002847480970   # Kanal numeric ID (ishonchliroq)
 CHANNEL_USER = "@huquqologiyauz"
 CHANNEL_LINK = "https://t.me/huquqologiyauz"
-DATA_FILE    = "data.json"
+# Ma'lumotlar fayli — Railway Volume /data papkasida, yo'q bo'lsa joriy papkada
+DATA_DIR = "/data" if os.path.exists("/data") else "."
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
 # O'zbekiston vaqt zonasi: UTC+5
 UZT = timezone(timedelta(hours=5))
@@ -446,7 +448,7 @@ async def start_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✍️ *Javob berish*\n\n"
         "1️⃣ Ism va familiyangizni yuboring:\n"
-        "_(Misol: Aliyev Vali)_\n\n"
+        "_(Misol: Usmonov Ibrohim)_\n\n"
         "Bekor qilish: /cancel",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardMarkup([["❌ Bekor qilish"]], resize_keyboard=True)
@@ -625,16 +627,31 @@ async def show_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_kb(uid, data)
         )
         return
+
+    # Eski "Mening testlarim" xabarini o'chirish
+    old_msg_id = ctx.user_data.get("my_tests_msg_id")
+    if old_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.message.chat_id, message_id=old_msg_id)
+        except Exception:
+            pass
+        ctx.user_data.pop("my_tests_msg_id", None)
+
+    btns = _build_my_tests_buttons(my, data)
+    sent = await update.message.reply_text(
+        "📋 *Mening testlarim:*\n\nBoshqarish uchun tanlang 👇",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(btns)
+    )
+    ctx.user_data["my_tests_msg_id"] = sent.message_id
+
+def _build_my_tests_buttons(my, data):
     btns = []
     for tid, t in my.items():
         st = "🟢" if t.get("active") else "🔴"
         cnt = len(data["results"].get(tid, []))
         btns.append([InlineKeyboardButton(f"{st} {t['name']} ({cnt} javob)", callback_data=f"ti:{tid}")])
-    await update.message.reply_text(
-        "📋 *Mening testlarim:*\n\nBoshqarish uchun tanlang 👇",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(btns)
-    )
+    return btns
 
 async def cb_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -645,13 +662,9 @@ async def cb_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not my:
         await q.edit_message_text("📭 Sizda test yo'q.")
         return
-    btns = []
-    for tid, t in my.items():
-        st = "🟢" if t.get("active") else "🔴"
-        cnt = len(data["results"].get(tid, []))
-        btns.append([InlineKeyboardButton(f"{st} {t['name']} ({cnt} javob)", callback_data=f"ti:{tid}")])
+    btns = _build_my_tests_buttons(my, data)
     await q.edit_message_text(
-        "📋 *Mening testlarim:*",
+        "📋 *Mening testlarim:*\n\nBoshqarish uchun tanlang 👇",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(btns)
     )
@@ -699,11 +712,14 @@ async def cb_test_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "end":
         data["tests"][tid]["active"] = False
         save_data(data)
+        # Yakunlangandan keyin darhol boshqaruv panelini yangilab ko'rsat
         await q.edit_message_text(
             f"✅ *{test['name']}* yakunlandi!\n\n"
             f"👥 Jami {len(results)} ta ishtirokchi\n\n"
-            "Statistika uchun testni yana oching 👆",
-            parse_mode=ParseMode.MARKDOWN
+            f"🔑 ID: `{tid}`\n"
+            f"📍 Holat: 🔴 Yakunlangan",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=test_mgmt_kb(tid, active=False)
         )
 
     elif action == "pdf":
