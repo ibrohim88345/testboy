@@ -448,7 +448,7 @@ async def start_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✍️ *Javob berish*\n\n"
         "1️⃣ Ism va familiyangizni yuboring:\n"
-        "_(Misol: Aliyev Vali)_\n\n"
+        "_(Misol: Usmonov Ibrohim)_\n\n"
         "Bekor qilish: /cancel",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardMarkup([["❌ Bekor qilish"]], resize_keyboard=True)
@@ -627,30 +627,26 @@ async def show_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_kb(uid, data)
         )
         return
-
-    # Eski "Mening testlarim" xabarini o'chirish
-    old_msg_id = ctx.user_data.get("my_tests_msg_id")
-    if old_msg_id:
-        try:
-            await ctx.bot.delete_message(chat_id=update.message.chat_id, message_id=old_msg_id)
-        except Exception:
-            pass
-        ctx.user_data.pop("my_tests_msg_id", None)
-
-    btns = _build_my_tests_buttons(my, data)
     sent = await update.message.reply_text(
         "📋 *Mening testlarim:*\n\nBoshqarish uchun tanlang 👇",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(btns)
+        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, sent_id=0))
     )
-    ctx.user_data["my_tests_msg_id"] = sent.message_id
+    # Xabar ID'sini o'zimizga embed qilamiz — tugmalarni qayta yozamiz
+    await sent.edit_reply_markup(
+        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, sent_id=sent.message_id))
+    )
 
-def _build_my_tests_buttons(my, data):
+def _my_tests_btns(my, data, sent_id=0):
     btns = []
     for tid, t in my.items():
         st = "🟢" if t.get("active") else "🔴"
         cnt = len(data["results"].get(tid, []))
-        btns.append([InlineKeyboardButton(f"{st} {t['name']} ({cnt} javob)", callback_data=f"ti:{tid}")])
+        # callback: ti:TEST_ID:MSG_ID — msg_id o'chirish uchun
+        btns.append([InlineKeyboardButton(
+            f"{st} {t['name']} ({cnt} javob)",
+            callback_data=f"ti:{tid}:{sent_id}"
+        )])
     return btns
 
 async def cb_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -662,17 +658,21 @@ async def cb_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not my:
         await q.edit_message_text("📭 Sizda test yo'q.")
         return
-    btns = _build_my_tests_buttons(my, data)
+    msg_id = q.message.message_id
     await q.edit_message_text(
         "📋 *Mening testlarim:*\n\nBoshqarish uchun tanlang 👇",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(btns)
+        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, sent_id=msg_id))
     )
 
 async def cb_test_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    _, tid = q.data.split(":", 1)
+    # format: ti:TEST_ID:LIST_MSG_ID
+    parts = q.data.split(":")
+    tid = parts[1]
+    list_msg_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+
     data = load_data()
     test = data["tests"].get(tid)
     if not test:
@@ -681,18 +681,38 @@ async def cb_test_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if test.get("owner_id") != q.from_user.id:
         await q.edit_message_text("❌ Bu test sizniki emas.")
         return
+
     cnt = len(data["results"].get(tid, []))
     status = "🟢 Faol" if test.get("active") else "🔴 Yakunlangan"
-    await q.edit_message_text(
-        f"📋 *{test['name']}*\n\n"
-        f"🔑 ID: `{tid}`\n"
-        f"📊 Savollar: *{len(test['answers'])}* ta\n"
-        f"👥 Javoblar: *{cnt}* ta\n"
-        f"📍 Holat: {status}\n"
-        f"📅 Yaratilgan: {test['created_at'][:10]}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=test_mgmt_kb(tid, test.get("active", False))
-    )
+
+    # Ro'yxat xabarini o'chirib, boshqaruv panelini yangi xabar sifatida yuboramiz
+    if list_msg_id and list_msg_id != q.message.message_id:
+        try:
+            await ctx.bot.delete_message(chat_id=q.message.chat_id, message_id=list_msg_id)
+        except Exception:
+            pass
+        await ctx.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=f"📋 *{test['name']}*\n\n"
+                 f"🔑 ID: `{tid}`\n"
+                 f"📊 Savollar: *{len(test['answers'])}* ta\n"
+                 f"👥 Javoblar: *{cnt}* ta\n"
+                 f"📍 Holat: {status}\n"
+                 f"📅 Yaratilgan: {test['created_at'][:10]}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=test_mgmt_kb(tid, test.get("active", False))
+        )
+    else:
+        await q.edit_message_text(
+            f"📋 *{test['name']}*\n\n"
+            f"🔑 ID: `{tid}`\n"
+            f"📊 Savollar: *{len(test['answers'])}* ta\n"
+            f"👥 Javoblar: *{cnt}* ta\n"
+            f"📍 Holat: {status}\n"
+            f"📅 Yaratilgan: {test['created_at'][:10]}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=test_mgmt_kb(tid, test.get("active", False))
+        )
 
 async def cb_test_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -769,7 +789,7 @@ async def cb_test_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑 Ha, o'chir", callback_data=f"delok:{tid}")],
-                [InlineKeyboardButton("❌ Yo'q", callback_data=f"ti:{tid}")]
+                [InlineKeyboardButton("❌ Yo'q", callback_data=f"ti:{tid}:0")]
             ])
         )
 
