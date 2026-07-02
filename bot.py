@@ -627,25 +627,25 @@ async def show_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_kb(uid, data)
         )
         return
+    # Avval placeholder yuboramiz
     sent = await update.message.reply_text(
         "📋 *Mening testlarim:*\n\nBoshqarish uchun tanlang 👇",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, sent_id=0))
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Yuklanmoqda...", callback_data="noop")]])
     )
-    # Xabar ID'sini o'zimizga embed qilamiz — tugmalarni qayta yozamiz
+    # Keyin haqiqiy tugmalarni msg_id bilan edit qilamiz
     await sent.edit_reply_markup(
-        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, sent_id=sent.message_id))
+        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, msg_id=sent.message_id))
     )
 
-def _my_tests_btns(my, data, sent_id=0):
+def _my_tests_btns(my, data, msg_id=0):
     btns = []
     for tid, t in my.items():
         st = "🟢" if t.get("active") else "🔴"
         cnt = len(data["results"].get(tid, []))
-        # callback: ti:TEST_ID:MSG_ID — msg_id o'chirish uchun
         btns.append([InlineKeyboardButton(
             f"{st} {t['name']} ({cnt} javob)",
-            callback_data=f"ti:{tid}:{sent_id}"
+            callback_data=f"ti:{tid}:{msg_id}"
         )])
     return btns
 
@@ -658,11 +658,10 @@ async def cb_my_tests(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not my:
         await q.edit_message_text("📭 Sizda test yo'q.")
         return
-    msg_id = q.message.message_id
     await q.edit_message_text(
         "📋 *Mening testlarim:*\n\nBoshqarish uchun tanlang 👇",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, sent_id=msg_id))
+        reply_markup=InlineKeyboardMarkup(_my_tests_btns(my, data, msg_id=q.message.message_id))
     )
 
 async def cb_test_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -979,6 +978,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern="^noop$"))
     app.add_handler(CallbackQueryHandler(cb_check_sub, pattern="^check_sub$"))
     app.add_handler(CallbackQueryHandler(cb_my_tests, pattern="^my_tests$"))
     app.add_handler(CallbackQueryHandler(cb_test_info, pattern="^ti:"))
