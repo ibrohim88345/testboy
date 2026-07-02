@@ -448,7 +448,7 @@ async def start_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✍️ *Javob berish*\n\n"
         "1️⃣ Ism va familiyangizni yuboring:\n"
-        "_(Misol: Usmonov Ibrohim)_\n\n"
+        "_(Misol: Aliyev Vali)_\n\n"
         "Bekor qilish: /cancel",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardMarkup([["❌ Bekor qilish"]], resize_keyboard=True)
